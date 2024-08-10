@@ -71,8 +71,6 @@
 
 #include "RegAllocGreedy.h"
 #include "RegAllocScore.h"
-#include "MachineCopyPropagation.cpp"
-#include "DeadMachineInstructionElim.cpp"
 
 using namespace llvm;
 
@@ -80,11 +78,16 @@ using namespace llvm;
 
 static RegisterRegAlloc gradRegAlloc("grad", "grad register allocator", createGradRegisterAllocator);
 
-static cl::opt<bool> NoSplitLoop("no-split-loop", cl::Hidden, cl::desc("Disable split by loop."), cl::init(false));
+// Have bugs
+static cl::opt<bool> NoSplitLoop("no-split-loop", cl::Hidden, cl::desc("Disable split by loop."), cl::init(true));
+
+
 static cl::opt<bool> NoSplitFCall("no-split-fcall", cl::Hidden, cl::desc("Disable split by function call."), cl::init(false));
 static cl::opt<bool> Dump("dump-grad", cl::Hidden, cl::desc("Dump program."), cl::init(false));
 static cl::opt<bool> DumpInfo("dump-info", cl::Hidden, cl::desc("Dump information for LM process."), cl::init(false));
-static cl::opt<std::string> RunOnly("run-only", cl::Hidden, cl::desc("only use grad for certain machine function."), cl::init(""));
+
+static cl::opt<int> loadCFGID("load-cfg-id", cl::Hidden, cl::desc("Config id for loading."), cl::init(0));
+static cl::opt<std::string> PathPrefix("ra-path-prefix", cl::Hidden, cl::desc("Prefix for pathes"), cl::init("./"));
 
 char RAGrad::ID = 0;
 char &llvm::RAGradID = RAGrad::ID;
@@ -226,6 +229,7 @@ void RAGrad::specifyEdges() {
       edge_freqs.push_back(freq);
     }
   }
+  updateRegMap();
 }
 
 void RAGrad::splitEdges() {
@@ -302,7 +306,7 @@ void RAGrad::splitByFcall() {
     std::set<MachineBasicBlock*> alive_through;
     std::set<MachineBasicBlock*> alives;
     std::map<MachineBasicBlock*, int > bb2bi;
-  	for (int i = 0; i < UseBlocks.size(); i++) {
+  	for (int i = 0; i < int(UseBlocks.size()); i++) {
       auto BI = UseBlocks[i];
       if (BI.LiveOut && BI.LiveIn) { alive_through.insert(BI.MBB); }
       if (BI.LiveIn) { alive_ins.insert(BI.MBB); }
@@ -353,15 +357,6 @@ void RAGrad::splitByFcall() {
   }
   updateIntervals(newvregs, new_intervs);
   if (Dump) { LIS->dump(); }
-}
-
-bool RAGrad::isBundleCompact(unsigned buno, std::set<unsigned>* bb_w_uses) {
-  for (unsigned bbno : Bundles->getBlocks(buno)) {
-    // Ignore Live out bb
-    if (buno != Bundles->getBundle(bbno, false)) continue;
-    if (bb_w_uses->find(bbno) != bb_w_uses->end()) return true;
-  }
-  return false;
 }
 
 void RAGrad::splitByLoop() {
@@ -490,8 +485,7 @@ bool RAGrad::isCoalCopy(const MachineInstr* MI) {
 void RAGrad::splitIntervals() {
   SmallVector<Register, 4> newvregs;
   std::list<LiveInterval*> new_intervs;
-  for (int k = 0; k < all_intervs.size(); k++) {
-    auto VirtReg = all_intervs[k];
+  for (auto VirtReg : all_intervs) {
     SA->analyze(VirtReg);
     LiveRangeEdit LREdit(VirtReg, newvregs, *MF, *LIS, VRM, nullptr, &DeadRemats);
     SE->reset(LREdit, SplitEditor::SM_Partition);
@@ -499,7 +493,6 @@ void RAGrad::splitIntervals() {
     if (Uses.size() <= 1) {
       // Not splitted
       new_intervs.push_back(VirtReg);
-      intrv2parent.insert(std::make_pair(VirtReg, k));
       spillable.insert(VirtReg->reg());
       continue ;
     }
@@ -516,7 +509,6 @@ void RAGrad::splitIntervals() {
     if (LREdit.empty()) {
       // Not splitted
       new_intervs.push_back(VirtReg);
-      intrv2parent.insert(std::make_pair(VirtReg, k));
       spillable.insert(VirtReg->reg());
       continue ;
     }
@@ -529,7 +521,6 @@ void RAGrad::splitIntervals() {
         emptyIntervs.push_back(interv);
         continue;
       }
-      intrv2parent.insert(std::make_pair(interv, k));
       auto start = interv->segments[0].start;
       auto end = interv->segments[0].end;
       bool unspillable = false;
@@ -551,13 +542,15 @@ void RAGrad::splitIntervals() {
 
 void RAGrad::updateIntervals(SmallVector<Register, 4>& newvregs, std::list<LiveInterval*>& newintervs) {
   all_intervs.clear();
+  std::vector<LiveInterval*> temp_intervs;
+  std::map<Register, std::vector<LiveInterval*>> subintervals;
   for (auto interv : newintervs) {
     if (interv->empty()) { 
       emptyIntervs.push_back(interv);
       continue;
      }
     interv->setWeight(0);
-    all_intervs.push_back(interv);
+    temp_intervs.push_back(interv);
   }
   for (Register reg : newvregs) {
     auto interv = &LIS->getInterval(reg);
@@ -566,7 +559,32 @@ void RAGrad::updateIntervals(SmallVector<Register, 4>& newvregs, std::list<LiveI
       continue;
     }
     interv->setWeight(0);
-    all_intervs.push_back(interv);
+    temp_intervs.push_back(interv);
+  }
+  // Sort each sub interval
+  for (auto intv : temp_intervs) {
+    Register orireg = VRM->getOriginal(intv->reg());
+    auto find = subintervals.find(orireg);
+    if (find == subintervals.end()) {
+      std::vector<LiveInterval*> intervs;
+      intervs.push_back(intv);
+      subintervals.insert(std::make_pair(orireg, std::move(intervs)));
+    } else {
+      find->second.push_back(intv);
+    }
+  }
+  for (auto iter = subintervals.begin(); iter != subintervals.end(); iter++) {
+    std::vector<std::pair<SlotIndex, LiveInterval*>> seg_starts;
+    for (LiveInterval* interv : iter->second) {
+      assert (!interv->empty()); 
+      seg_starts.push_back(std::make_pair(interv->segments[0].start, interv));
+    }
+    std::sort(seg_starts.begin(), seg_starts.end(), [](std::pair<SlotIndex, LiveInterval*> p1, std::pair<SlotIndex, LiveInterval*> p2) {
+      return p1.first < p2.first;
+    });
+    for (int i = 0; i < int(seg_starts.size()); i++) {
+      all_intervs.push_back(seg_starts[i].second);
+    }
   }
 }
 
@@ -624,26 +642,7 @@ bool RAGrad::identifyAllowedRegs(Register Reg, std::vector<LiveInterval*>* gener
   return false;
 }
 
-void RAGrad::seedLiveRegs() {
-  for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
-    Register Reg = Register::index2VirtReg(i);
-	  if (Reg.id() == 0) { continue; }
-    if (MRI->reg_nodbg_empty(Reg))
-      continue;
-    LiveInterval* VRegLI = &LIS->getInterval(Reg);
-    if (VRegLI->empty()) {
-      emptyIntervs.push_back(VRegLI);
-      continue;
-    }
-
-	  std::vector<LiveInterval*> generated;
-    bool spilled = identifyAllowedRegs(Reg, &generated);
-	  if (!spilled) {
-      all_intervs.push_back(VRegLI);
-	  } else {
-		  all_intervs.insert(all_intervs.end(), generated.begin(), generated.end());
-	  }
-  }
+void RAGrad::updateRegMap() {
   // Process Register information
   for (auto rc : regs_classes) {
     ArrayRef<MCPhysReg> RawPRegOrder = rc->getRawAllocationOrder(*MF);
@@ -672,13 +671,36 @@ void RAGrad::seedLiveRegs() {
   } 
 }
 
+void RAGrad::seedLiveRegs() {
+  for (unsigned i = 0, e = MRI->getNumVirtRegs(); i != e; ++i) {
+    Register Reg = Register::index2VirtReg(i);
+	  if (Reg.id() == 0) { continue; }
+    if (MRI->reg_nodbg_empty(Reg))
+      continue;
+    LiveInterval* VRegLI = &LIS->getInterval(Reg);
+    if (VRegLI->empty()) {
+      emptyIntervs.push_back(VRegLI);
+      continue;
+    }
+
+	  std::vector<LiveInterval*> generated;
+    bool spilled = identifyAllowedRegs(Reg, &generated);
+	  if (!spilled) {
+      all_intervs.push_back(VRegLI);
+	  } else {
+		  all_intervs.insert(all_intervs.end(), generated.begin(), generated.end());
+	  }
+  }
+  updateRegMap();
+}
+
 void RAGrad::dumpIntervals() {
   std::ofstream outfile;
-  outfile.open("." + MF->getName().str() + "_intervals");
+  outfile.open(PathPrefix + "." + MF->getName().str() + "_intervals");
   // For callee saved registers
   std::string cs_str = "[";
   if (TRI->getCSRFirstUseCost() > 0 ) {
-    for (int i = 0; i < phy2alias.size(); i++) {
+    for (int i = 0; i < int(phy2alias.size()); i++) {
       auto regset = phy2alias[i];
       bool is_saved = false;
       for (auto reg : regset) {
@@ -723,8 +745,10 @@ void RAGrad::dumpIntervals() {
     reg_str = reg_str.substr(0, reg_str.size() - 1);
     reg_str.append("];");
     outfile << reg_str;
+    outfile << Register::virtReg2Index(VRM->getOriginal(vreg)) << ";";
     // Register Hints
     int phint = -1;
+    float freq = 0;
     for (const MachineInstr &Instr : MRI->reg_nodbg_instructions(vreg)) {
       if (!TII->isFullCopyInstr(Instr)) continue;
       // Copy from one sub interval to another, already exists
@@ -740,16 +764,18 @@ void RAGrad::dumpIntervals() {
         phint = find->second;
         regs_allowed_map[interv].push_back(OtherReg);
       }
+      freq = getPointFreq(LIS->getInstructionIndex(Instr));
     }
     // Physical Hint
-    outfile << phint << "\n";
+    outfile << phint << ";";
+    outfile << freq << "\n";
   }
   outfile.close(); 
 }
 
 void RAGrad::dumpEdges() {
   std::ofstream outfile;
-  outfile.open("." + MF->getName().str() + "_edges");
+  outfile.open(PathPrefix + "." + MF->getName().str() + "_edges");
   for (int i = 0; i < int(from_ids.size()); i++) {
     outfile << from_ids[i] << ";" << to_ids[i] << ";"  << edge_freqs[i] << "\n";
   }
@@ -768,12 +794,12 @@ float RAGrad::getPointFreq(SlotIndex index) {
 }
 
 void RAGrad::dumpInfo() {
-  specifyEdges();
   dumpIntervals();
   dumpEdges();
 }
 
 Register RAGrad::getAllowedAlias(LiveInterval* interv, int phyidx) {
+    assert(regs_allowed_map.find(interv) != regs_allowed_map.end());
     auto intv_regs_allowed = regs_allowed_map[interv];
     auto regset = phy2alias[phyidx];
     for (auto reg : regset) {
@@ -787,10 +813,11 @@ Register RAGrad::getAllowedAlias(LiveInterval* interv, int phyidx) {
 
 void RAGrad::loadConfig(std::vector<int>& result) {
   std::ifstream infile;
-  std::string fpath = "." + MF->getName().str() + "_result";
+  std::string fpath = PathPrefix + "." + MF->getName().str() + "_result_" + std::to_string(loadCFGID);
   infile.open(fpath);
   std::string line;
   while (std::getline(infile, line)) {
+    std::cout << line << std::endl;
     int pos = std::stoi(line);
     result.push_back(pos);
   }
@@ -800,21 +827,20 @@ void RAGrad::loadConfig(std::vector<int>& result) {
 // Make a default configuration by spilling all spillable intervs
 void RAGrad::makeDConfig(std::vector<int>& result) {
   std::map<Register, LiveInterval*> reg2interv_;
-  int i = 0;
   for (auto vreginterv : all_intervs) {
     // Spill all spillable
     if (spillable.find(vreginterv->reg()) != spillable.end()) {
       result.push_back(-1);
+      continue;
     }
     // Alloc for a allowd non-conflict register
-    bool alloced = false;
     for (auto phyreg : regs_allowed_map[vreginterv]) {
       auto find = reg2interv_.find(phyreg);
       // Skip non free regs
       if (find != reg2interv_.end()) continue;
       // Alloc a free reg
       bool find_reg_id = false;
-      for (int phyid = 0; phyid < phy2alias.size(); phyid++) {
+      for (int phyid = 0; phyid < int(phy2alias.size()); phyid++) {
         auto regset = phy2alias[phyid];
         if (regset.find(phyreg) == regset.end()) continue;
         result.push_back(phyid);
@@ -824,19 +850,21 @@ void RAGrad::makeDConfig(std::vector<int>& result) {
       assert(find_reg_id);
       break;
     }
-    i++;
   }
 }
+
 
 void RAGrad::assignReg(std::vector<int>& result) {
   // First spill intervals, this will introduce renamed vregs
   int i = 0;
   std::list<LiveInterval*> spilled;
+  std::set<Register> spilled_set;
   for (auto vreginterv : all_intervs) {
     int idx = result[i];
     i++;
     if (idx == -1)  {
       spilled.push_back(vreginterv);
+      spilled_set.insert(vreginterv->reg());
       continue;
     }
     Register phyreg = getAllowedAlias(vreginterv, idx);
@@ -849,7 +877,7 @@ void RAGrad::assignReg(std::vector<int>& result) {
     vreginterv->setWeight(0);
     SmallVector<Register, 4> newvregs;
     LiveRangeEdit LRE(vreginterv, newvregs, *MF, *LIS, VRM, nullptr, &DeadRemats);
-    SpillerInstance->spill(LRE);
+    SpillerInstance->spill(LRE, &spilled_set);
     // Spilling may rename registers
     for (auto newvreg : newvregs) {
       if (!newvreg.isVirtual()) continue;
@@ -887,11 +915,14 @@ void RAGrad::assignReg(std::vector<int>& result) {
         }
         if (VRM->getPhys(newvreg) != VirtRegMap::NO_PHYS_REG) { continue; }
       }
+      if (LIS->getInterval(newvreg).empty()) { continue; }
 
-      // Case 3. Old reg is to be spilled, but splitted or renamed by LRE (caused by rematerialization).
+  //  assert(false);
+    //// Case 3. Old reg is to be spilled, but splitted by LRE.
       auto finditer = std::find(spilled.begin(), spilled.end(), &LIS->getInterval(oldvreg));
       if (finditer != spilled.end() || oldvreg == vreginterv->reg()) {
         spilled.push_back(&LIS->getInterval(newvreg));
+        spilled_set.insert(newvreg);
       }
     }
   }
@@ -929,51 +960,62 @@ void RAGrad::finalizeAlloc() {
   }
 }
 
-bool RAGrad::runOnMachineFunction(MachineFunction &mf) {
-  LLVM_DEBUG(dbgs() << "********** GREEDY REGISTER ALLOCATION **********\n"
-                    << "********** Function: " << mf.getName() << '\n');
-  MF = &mf;
-  TII = MF->getSubtarget().getInstrInfo();
-  MF->verify(this, "Before greedy register allocator");
-  LIS = &getAnalysis<LiveIntervals>();
-  DomTree = &getAnalysis<MachineDominatorTree>();
-  Loops = &getAnalysis<MachineLoopInfo>();
-  if (Dump) { LIS->dump(); }
-  if (!NoSplitLoop) splitEdges();
-  Indexes = &getAnalysis<SlotIndexes>();
+void RAGrad::set_ana(MachineFunction &mf) {
   Indexes->releaseMemory();
   Indexes->runOnMachineFunction(mf);
   Indexes->packIndexes();
-  LIS->releaseMemory();
-  LIS->runOnMachineFunction(mf);
-  VRM = &getAnalysis<VirtRegMap>();
+
   TRI = &VRM->getTargetRegInfo();
   MRI = &VRM->getRegInfo();
   MRI->freezeReservedRegs(VRM->getMachineFunction());
+
+  LIS->releaseMemory();
+  LIS->runOnMachineFunction(mf);
+
+
   RegClassInfo.runOnMachineFunction(VRM->getMachineFunction());
-  MBFI = &getAnalysis<MachineBlockFrequencyInfo>();
   MBFI->runOnMachineFunction(mf);
-  DebugVars = &getAnalysis<LiveDebugVariables>();
-  auto VRAI = std::make_unique<VirtRegAuxInfo>(*MF, *LIS, *VRM, *Loops, *MBFI);
+  VRAI = new VirtRegAuxInfo(mf, *LIS, *VRM, *Loops, *MBFI);
   SpillerInstance.reset(createInlineSpiller(*this, *MF, *VRM, *VRAI));
   SA.reset(new SplitAnalysis(*VRM, *LIS, *Loops));
   SE.reset(new SplitEditor(*SA, *LIS, *VRM, *DomTree, *MBFI, *VRAI));
-  if (!hasVirtRegAlloc()) return false;
-  Bundles = &getAnalysis<EdgeBundles>();
-  Bundles->runOnMachineFunction(mf);
+}
 
+void RAGrad::get_ana(MachineFunction &mf) {
+  MF = &mf;
+  TII = MF->getSubtarget().getInstrInfo();
+  LIS = &getAnalysis<LiveIntervals>();
+  DomTree = &getAnalysis<MachineDominatorTree>();
+  Loops = &getAnalysis<MachineLoopInfo>();
+  Indexes = &getAnalysis<SlotIndexes>();
+  MBFI = &getAnalysis<MachineBlockFrequencyInfo>();
+  DebugVars = &getAnalysis<LiveDebugVariables>();
+  VRM = &getAnalysis<VirtRegMap>();
+}
+
+bool RAGrad::runOnMachineFunction(MachineFunction &mf) {
+  LLVM_DEBUG(dbgs() << "********** GREEDY REGISTER ALLOCATION **********\n"
+                    << "********** Function: " << mf.getName() << '\n');
+  get_ana(mf);
+  if (Dump) { LIS->dump(); }
+  if (!NoSplitLoop) splitEdges();
+  if (Dump) { LIS->dump(); }
+  set_ana(mf);
+  if (!hasVirtRegAlloc()) return false;
   seedLiveRegs();
+
   if (!NoSplitLoop) { splitByLoop(); }
   if (!NoSplitFCall) { splitByFcall(); }
   splitIntervals();
+  specifyEdges();
+
   std::vector<int> result;
+  dumpInfo();
   if (DumpInfo) {
-    dumpInfo();
     makeDConfig(result);
   } else {
     loadConfig(result);
   }
-
   assignReg(result);
   finalizeAlloc();
   spiller().postOptimization();
@@ -985,11 +1027,6 @@ bool RAGrad::runOnMachineFunction(MachineFunction &mf) {
   clear();
   if (Dump) { LIS->dump(); }
   MF->verify(this, "After register allocator");
-  std::cout << "After RA" << std::endl;
   MBFI->runOnMachineFunction(mf);
-
-  auto score = calculateRegAllocScore(mf, *MBFI);
-  std::cout << "GRAD----" << std::endl;
-  score.dump();
   return true;
 }

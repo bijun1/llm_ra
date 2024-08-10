@@ -45,6 +45,7 @@ class MachineOptimizationRemarkMissed;
 class SlotIndexes;
 class TargetInstrInfo;
 class VirtRegMap;
+class VirtRegAuxInfo;
 
 class RAGrad : public MachineFunctionPass {
 protected:
@@ -53,6 +54,7 @@ protected:
   VirtRegMap *VRM = nullptr;
   LiveIntervals *LIS = nullptr;
   LiveRegMatrix *Matrix = nullptr;
+  VirtRegAuxInfo *VRAI = nullptr;
   RegisterClassInfo RegClassInfo;
   const RegClassFilterFunc ShouldAllocateClass;
 public:
@@ -165,14 +167,12 @@ private:
   void seedLiveRegs();
   bool hasVirtRegAlloc();
   void splitEdges();
-  void splitByRegion();
   void splitByLoop();
   void splitByFcall();
   void splitIntervals();
   void dumpInfo();
   void assignReg(std::vector<int>& result);
   void dumpIntervals();
-  void dumpFreqs();
   void dumpEdges();
   void finalizeAlloc();
   float getPointFreq(SlotIndex index);
@@ -180,13 +180,16 @@ private:
   void makeDConfig(std::vector<int>& result);
   void loadConfig(std::vector<int>& result);
 
-  bool isBundleCompact(unsigned buno, std::set<unsigned>* bb_w_uses);
   bool isCoalCopy(const MachineInstr* mi);
   bool instWithHints(MachineInstr& mi);
+  void set_ana(MachineFunction &mf);
+  void get_ana(MachineFunction &mf);
   
 
   bool isACalleeSavedRegister(MCRegister Reg);
   void updateIntervals(SmallVector<Register, 4>& newvregs, std::list<LiveInterval*>& newintervs);
+  void makeNoRematInsts(LiveInterval* interv, std::set<MachineInstr*>& insts, std::set<LiveInterval*>& spilled);
+  void updateRegMap();
 
   int getFromRegID(int reg_id) {
     for (int i = 0; i < int(to_ids.size()); i++) {

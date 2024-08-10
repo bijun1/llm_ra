@@ -1434,9 +1434,6 @@ bool TargetPassConfig::addRegAssignAndRewriteOptimized() {
   // Finally rewrite virtual registers.
   addPass(&VirtRegRewriterID);
 
-  // Regalloc scoring for ML-driven eviction - noop except when learning a new
-  // eviction policy.
-  addPass(createRegAllocScoringPass());
   return true;
 }
 
@@ -1495,6 +1492,7 @@ void TargetPassConfig::addOptimizedRegAlloc() {
   // PreRA instruction scheduling.
   addPass(&MachineSchedulerID);
 
+  addPass(createRegAllocScoringPass());
   if (addRegAssignAndRewriteOptimized()) {
     // Perform stack slot coloring and post-ra machine LICM.
     addPass(&StackSlotColoringID);
@@ -1513,6 +1511,9 @@ void TargetPassConfig::addOptimizedRegAlloc() {
     addPass(&MachineLICMID);
   }
   addPass(&DeadMachineInstructionElimID);
+  // Regalloc scoring for ML-driven eviction - noop except when learning a new
+  // eviction policy.
+  addPass(createRegAllocScoringPass());
 }
 
 //===---------------------------------------------------------------------===//

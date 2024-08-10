@@ -28,7 +28,7 @@ public:
   virtual ~Spiller() = 0;
 
   /// spill - Spill the LRE.getParent() live interval.
-  virtual void spill(LiveRangeEdit &LRE) = 0;
+  virtual void spill(LiveRangeEdit &LRE, std::set<Register>* spilled_regs=nullptr) = 0;
 
   virtual void postOptimization() {}
 };

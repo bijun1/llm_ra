@@ -41,6 +41,8 @@
 #include <array>
 #include <bitset>
 #include <memory>
+#include <iostream>
+#include <fstream>
 
 using namespace llvm;
 
@@ -54,6 +56,10 @@ using CompiledModelType = RegAllocEvictModel;
 using CompiledModelType = NoopSavedModelImpl;
 #endif
 
+static cl::opt<std::string> scoreLog(
+    "ra-score-log", cl::Hidden,
+    cl::desc("Log file path of ra scores"));
+
 static cl::opt<std::string> InteractiveChannelBaseName(
     "regalloc-evict-interactive-channel-base", cl::Hidden,
     cl::desc(
@@ -63,8 +69,8 @@ static cl::opt<std::string> InteractiveChannelBaseName(
         "<regalloc-evict-interactive-channel-base>.out"));
 
 // Options that only make sense in development mode
-#ifdef LLVM_HAVE_TFLITE
 #include "RegAllocScore.h"
+#ifdef LLVM_HAVE_TFLITE
 #include "llvm/Analysis/Utils/TFUtils.h"
 
 static cl::opt<std::string> TrainingLog(
@@ -1134,6 +1140,11 @@ int64_t DevelopmentModeEvictAdvisor::tryFindEvictionCandidatePosition(
 }
 
 bool RegAllocScoring::runOnMachineFunction(MachineFunction &MF) {
+  auto score = calculateRegAllocScore(MF, getAnalysis<MachineBlockFrequencyInfo>()).getScore();
+  std::ofstream outfile;
+  outfile.open(scoreLog);
+  outfile << MF->getName().str() << " , " << score << "\n";  
+  outfile.close();
   std::optional<float> CachedReward;
   auto GetReward = [&]() {
     if (!CachedReward)
@@ -1160,5 +1171,14 @@ RegAllocEvictionAdvisorAnalysis *llvm::createReleaseModeAdvisor() {
 
 // In all cases except development mode, we don't need scoring.
 #if !defined(LLVM_HAVE_TFLITE)
-bool RegAllocScoring::runOnMachineFunction(MachineFunction &) { return false; }
+bool RegAllocScoring::runOnMachineFunction(MachineFunction &MF) {
+  auto score_pass = calculateRegAllocScore(MF, getAnalysis<MachineBlockFrequencyInfo>());
+  std::ofstream outfile(scoreLog, std::ios::app);
+  outfile << MF.getName().str() << "," << score_pass.getScore() << ","
+          << score_pass.copyCounts() << "," << score_pass.loadCounts() << "," << score_pass.storeCounts() << ","
+          << score_pass.loadStoreCounts() << "," << score_pass.expensiveRematCounts() << "," << score_pass.cheapRematCounts()
+          << "\n";  
+  outfile.close();
+   return false;
+}
 #endif

@@ -213,7 +213,7 @@ public:
         MBFI(Pass.getAnalysis<MachineBlockFrequencyInfo>()),
         HSpiller(Pass, MF, VRM), VRAI(VRAI) {}
 
-  void spill(LiveRangeEdit &) override;
+  void spill(LiveRangeEdit & Edit, std::set<Register>* spilled_regs=nullptr) override;
   void postOptimization() override;
 
 private:
@@ -229,7 +229,7 @@ private:
   void markValueUsed(LiveInterval*, VNInfo*);
   bool canGuaranteeAssignmentAfterRemat(Register VReg, MachineInstr &MI);
   bool reMaterializeFor(LiveInterval &, MachineInstr &MI);
-  void reMaterializeAll();
+  void reMaterializeAll(std::set<Register>* spilled_regs);
 
   bool coalesceStackAccess(MachineInstr *MI, Register Reg);
   bool foldMemoryOperand(ArrayRef<std::pair<MachineInstr *, unsigned>>,
@@ -239,6 +239,8 @@ private:
 
   void spillAroundUses(Register Reg);
   void spillAll();
+
+  bool noRemat(std::set<Register>* spilled_regs, MachineInstr& MI);
 };
 
 } // end anonymous namespace
@@ -726,9 +728,25 @@ bool InlineSpiller::reMaterializeFor(LiveInterval &VirtReg, MachineInstr &MI) {
   return true;
 }
 
+bool InlineSpiller::noRemat(std::set<Register>* spilled_regs, MachineInstr& MI) {
+  if (spilled_regs == nullptr) return false;
+  std::vector<Register> regs;
+  for (const MachineOperand& mo : MI.operands()) {
+    if (!mo.isReg()) continue;
+    auto reg = mo.getReg();
+    if (!reg.isVirtual()) continue;
+    if (spilled_regs->find(reg) == spilled_regs->end()) return false; 
+    regs.push_back(reg);
+  }
+  // Should be a move instruction
+  if (regs.size() != 2) return true;
+  assert(TII.isCopyInstr(MI));
+  return true;
+}
+
 /// reMaterializeAll - Try to rematerialize as many uses as possible,
 /// and trim the live ranges after.
-void InlineSpiller::reMaterializeAll() {
+void InlineSpiller::reMaterializeAll(std::set<Register>* spilled_regs) {
   if (!Edit->anyRematerializable())
     return;
 
@@ -742,6 +760,8 @@ void InlineSpiller::reMaterializeAll() {
       // Debug values are not allowed to affect codegen.
       if (MI.isDebugValue())
         continue;
+
+      if (noRemat(spilled_regs, MI)) continue;
 
       assert(!MI.isDebugInstr() && "Did not expect to find a use in debug "
              "instruction that isn't a DBG_VALUE");
@@ -1298,7 +1318,7 @@ void InlineSpiller::spillAll() {
     Edit->eraseVirtReg(Reg);
 }
 
-void InlineSpiller::spill(LiveRangeEdit &edit) {
+void InlineSpiller::spill(LiveRangeEdit &edit, std::set<Register>* spilled_regs) {
   ++NumSpilledRanges;
   Edit = &edit;
   assert(!Register::isStackSlot(edit.getReg()) &&
@@ -1318,7 +1338,7 @@ void InlineSpiller::spill(LiveRangeEdit &edit) {
 
   collectRegsToSpill();
   if (!NoRemat) {
-    reMaterializeAll();
+    reMaterializeAll(spilled_regs);
   }
 
   // Remat may handle everything.
