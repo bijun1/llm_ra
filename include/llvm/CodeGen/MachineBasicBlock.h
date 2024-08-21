@@ -42,6 +42,7 @@ class raw_ostream;
 class LiveIntervals;
 class TargetRegisterClass;
 class TargetRegisterInfo;
+class BBState;
 
 // This structure uniquely identifies a basic block section.
 // Possible values are
@@ -221,6 +222,8 @@ private:
 
   // MachineBasicBlocks are allocated and owned by MachineFunction.
   friend class MachineFunction;
+
+  friend class BBState;
 
 public:
   /// Return the LLVM basic block that this instance corresponded to originally.

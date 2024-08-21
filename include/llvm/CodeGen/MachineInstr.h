@@ -290,7 +290,6 @@ private:
   // Intrusive list support
   friend struct ilist_traits<MachineInstr>;
   friend struct ilist_callback_traits<MachineBasicBlock>;
-  void setParent(MachineBasicBlock *P) { Parent = P; }
 
   /// This constructor creates a copy of the given
   /// MachineInstr in the given MachineFunction.
@@ -325,6 +324,7 @@ public:
 
   const MachineBasicBlock* getParent() const { return Parent; }
   MachineBasicBlock* getParent() { return Parent; }
+  void setParent(MachineBasicBlock *P) { Parent = P; }
 
   /// Move the instruction before \p MovePos.
   void moveBefore(MachineInstr *MovePos);

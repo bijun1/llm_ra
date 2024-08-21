@@ -29,6 +29,7 @@ class MachineFunction;
 class MachineRegisterInfo;
 class raw_ostream;
 class TargetInstrInfo;
+class VRMState;
 
   class VirtRegMap : public MachineFunctionPass {
   public:
@@ -93,6 +94,9 @@ class TargetInstrInfo;
     const TargetRegisterInfo &getTargetRegInfo() const { return *TRI; }
 
     void grow();
+
+    friend class VRMState;
+
 
     /// returns true if the specified virtual register is
     /// mapped to a physical register
@@ -201,11 +205,36 @@ class TargetInstrInfo;
     void dump() const;
   };
 
+  class VRMState {
+    private:
+      IndexedMap<Register, VirtReg2IndexFunctor> Virt2PhysMap;
+      IndexedMap<int, VirtReg2IndexFunctor> Virt2StackSlotMap;
+      IndexedMap<unsigned, VirtReg2IndexFunctor> Virt2SplitMap;
+      DenseMap<unsigned, ShapeT> Virt2ShapeMap;
+      VirtRegMap* vrm;
+
+    public:
+      void save(VirtRegMap& VRM) {
+        Virt2PhysMap = VRM.Virt2PhysMap;
+        Virt2StackSlotMap = VRM.Virt2StackSlotMap;
+        Virt2SplitMap = VRM.Virt2SplitMap;
+        Virt2ShapeMap = VRM.Virt2ShapeMap;
+        vrm = &VRM;
+      }
+      void restore() {
+        vrm->Virt2PhysMap = Virt2PhysMap;
+        vrm->Virt2StackSlotMap = Virt2StackSlotMap;
+        vrm->Virt2SplitMap = Virt2SplitMap;
+        vrm->Virt2ShapeMap = Virt2ShapeMap;
+      }
+  };
+
   inline raw_ostream &operator<<(raw_ostream &OS, const VirtRegMap &VRM) {
     VRM.print(OS);
     return OS;
   }
 
 } // end llvm namespace
+
 
 #endif // LLVM_CODEGEN_VIRTREGMAP_H

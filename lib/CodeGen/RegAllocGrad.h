@@ -16,12 +16,15 @@
 #include "llvm/ADT/StringRef.h"
 #include "llvm/CodeGen/CalcSpillWeights.h"
 #include "llvm/CodeGen/LiveInterval.h"
+#include "llvm/CodeGen/LiveStacks.h"
 #include "llvm/CodeGen/LiveRangeEdit.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineFunctionPass.h"
 #include "llvm/CodeGen/RegisterClassInfo.h"
 #include "llvm/CodeGen/Spiller.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
+#include "llvm/CodeGen/VirtRegMap.h"
+#include "llvm/CodeGen/MachineRegisterInfo.h"
 #include <algorithm>
 #include <cstdint>
 #include <memory>
@@ -46,6 +49,50 @@ class SlotIndexes;
 class TargetInstrInfo;
 class VirtRegMap;
 class VirtRegAuxInfo;
+class LiveStacks;
+
+class BBState {
+  private:
+    MachineBasicBlock* bb;
+    std::vector<MachineInstr*> insts;
+
+  public:
+    void save(MachineBasicBlock& mbb, MachineFunction& mf) {
+      bb = &mbb;
+      insts.clear();
+      for (auto & instr : mbb) {
+        MachineInstr* inst = mf.CloneMachineInstr(&instr);
+        insts.push_back(inst);
+      }
+    }
+
+    void restore() {
+      bb->clear();
+      for (MachineInstr* inst : insts) {
+        bb->push_back(inst);
+        inst->setParent(bb);
+      }
+    }
+};
+
+class Score {
+  public:
+    double CopyCounts = 0.0;
+    double LoadCounts = 0.0;
+    double StoreCounts = 0.0;
+    double CheapRematCounts = 0.0;
+    double LoadStoreCounts = 0.0;
+    double ExpensiveRematCounts = 0.0;
+
+    double getScore() {
+      return 0.1 * CopyCounts +
+             4 * LoadCounts +
+            1 * StoreCounts +
+            0.5 * CheapRematCounts +
+            (1 + 4) * LoadStoreCounts +
+            1 * ExpensiveRematCounts;
+    }
+};
 
 class RAGrad : public MachineFunctionPass {
 protected:
@@ -53,6 +100,7 @@ protected:
   MachineRegisterInfo *MRI = nullptr;
   VirtRegMap *VRM = nullptr;
   LiveIntervals *LIS = nullptr;
+  LiveStacks* LSS = nullptr;
   LiveRegMatrix *Matrix = nullptr;
   VirtRegAuxInfo *VRAI = nullptr;
   RegisterClassInfo RegClassInfo;
@@ -65,19 +113,18 @@ public:
 
 private:
   // All the intervals to alloc
-  std::vector<LiveInterval*> all_intervs;
+  std::vector<Register> virtreg_worklist;
   std::set<MCRegister> spillable;
   // Physical registers to aliases
   std::vector<std::set<MCRegister>> phy2alias;
   // Aliases to physical registers
   std::map<MCRegister, int> alias2phy;
   // Allowed registers for each interval
-  std::map<LiveInterval*, std::vector<MCRegister>> regs_allowed_map;
-  std::map<LiveInterval*, int> intrv2parent;
+  std::map<Register, std::vector<MCRegister>> regs_allowed_map;
   // All refered register classes
   std::set<const TargetRegisterClass*> regs_classes;
   // Record all empty intervals
-  std::vector<LiveInterval*> emptyIntervs;
+  std::vector<Register> emptyIntervs;
   std::set<MachineBasicBlock*> newpreds;
   std::set<MachineBasicBlock*> newsuccs;
 
@@ -117,6 +164,10 @@ private:
   // state
   std::unique_ptr<Spiller> SpillerInstance;
 
+  // For saving machine function related data
+  std::vector<BBState> bb_states;
+  VRMState vrm_state;
+
 
 public:
   RAGrad(const RegClassFilterFunc F = allocateAllRegClasses);
@@ -131,19 +182,19 @@ public:
   Spiller &spiller() { return *SpillerInstance; }
 
   void clear() {
-	all_intervs.clear();
-	spillable.clear();
-	phy2alias.clear();
-	alias2phy.clear();
-	regs_allowed_map.clear();
-  intrv2parent.clear();
-	regs_classes.clear();
-	from_ids.clear();
-	to_ids.clear();
-	edge_freqs.clear();
-  emptyIntervs.clear();
-  newpreds.clear();
-  newsuccs.clear();
+    virtreg_worklist.clear();
+	  spillable.clear();
+	  phy2alias.clear();
+	  alias2phy.clear();
+	  regs_allowed_map.clear();
+	  regs_classes.clear();
+	  from_ids.clear();
+	  to_ids.clear();
+	  edge_freqs.clear();
+    emptyIntervs.clear();
+    newpreds.clear();
+    newsuccs.clear();
+    DeadRemats.clear();
   }
 
   /// Perform register allocation.
@@ -162,34 +213,36 @@ public:
   static char ID;
 
 private:
-  bool identifyAllowedRegs(Register reg, std::vector<LiveInterval*>* generated);
-  Register getAllowedAlias(LiveInterval* interv, int phyidx);
+  bool identifyAllowedRegs(Register reg);
+  Register getAllowedAlias(Register reg, int phyidx);
   void seedLiveRegs();
   bool hasVirtRegAlloc();
-  void splitEdges();
-  void splitByLoop();
   void splitByFcall();
   void splitIntervals();
-  void dumpInfo();
   void assignReg(std::vector<int>& result);
+  void dumpInfo();
   void dumpIntervals();
   void dumpEdges();
+  void dumpSize();
+  void dumpScores(std::vector<std::vector<double>>& scores);
+  void tune();
+  void eval();
   void finalizeAlloc();
   float getPointFreq(SlotIndex index);
   void specifyEdges();
-  void makeDConfig(std::vector<int>& result);
-  void loadConfig(std::vector<int>& result);
-
+  void makeDConfig(std::vector<int>& config);
+  void makeConfigs(std::vector<std::vector<int>>& configs);
   bool isCoalCopy(const MachineInstr* mi);
   bool instWithHints(MachineInstr& mi);
   void set_ana(MachineFunction &mf);
   void get_ana(MachineFunction &mf);
-  
-
   bool isACalleeSavedRegister(MCRegister Reg);
-  void updateIntervals(SmallVector<Register, 4>& newvregs, std::list<LiveInterval*>& newintervs);
-  void makeNoRematInsts(LiveInterval* interv, std::set<MachineInstr*>& insts, std::set<LiveInterval*>& spilled);
+  void updateIntervals(SmallVector<Register, 4>& newvregs);
   void updateRegMap();
+  void saveMF(MachineFunction& mf);
+  void restoreMF(MachineFunction& mf);
+  void clearDeadRemats();
+  Score calculateRegAllocScore();
 
   int getFromRegID(int reg_id) {
     for (int i = 0; i < int(to_ids.size()); i++) {
